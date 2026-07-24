@@ -88,6 +88,7 @@ class DSAKVCache:
     assert layer < self.layers, "layer is greater than max_layer"
     assert (segment == "attention" and d == self.attn_latent_dim) or \
            (segment == "indexer" and d == self.idx_k_cache_dim), "shape of dim is incorrect"
+    value = value.cast(self.store_attn.dtype)
     to_write = (positional_ids >= 0).sum(-1) # (B)
     padded_values = (positional_ids < 0).sum(-1) # (B)
     for b in range(B):
@@ -113,9 +114,9 @@ def apply_rope(x:Tensor, freqs_cis:Tensor, positional_ids: Tensor) -> Tensor:
   assert x.shape[-1] % 2 == 0
   valid = positional_ids >= 0 # (B, S)
   idx = valid.where(positional_ids, 0)
-  batched_freqs = freqs_cis[idx].cast(dtypes.bfloat16) # Taking slice for each token from freqs
+  batched_freqs = freqs_cis[idx].cast(dtypes.bfloat16)
   cos, sin = batched_freqs.reshape(x.shape[0], x.shape[1], 1, -1).chunk(2, dim=-1) # (B, S, 1, dim//2)
-  cos, sin = valid.unsqueeze(-2).unsqueeze(-1).where(cos, 1), valid.unsqueeze(-2).unsqueeze(-1).where(sin, 0)
+  cos, sin = valid.unsqueeze(-1).unsqueeze(-1).where(cos, 1), valid.unsqueeze(-1).unsqueeze(-1).where(sin, 0)
   x1, x2 = x[..., 0::2], x[..., 1::2]
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
 
@@ -369,7 +370,7 @@ def decode_tokens(tokenizer: GLMTokenizer, outputs: Tensor) -> tuple[list[int], 
 
 # NOTE: just to test on smaller gpu clusters
 testing_start_layer = 0
-testing_end_layer = 15
+testing_end_layer = 2
 
 indexer_types:list[IndexerType] = ["full", "full", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared", "full", "shared", "shared", "shared"]
 layer_types: list[LayerType] =  ["dense", "dense", "dense", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse", "sparse"]
@@ -424,18 +425,19 @@ def load_model(model: GLMModel,devices: tuple[str, ...]):
     model_state_dict[k].replace(v.to(device)).realize()
   return model
 
-def prefill(tokenizer: GLMTokenizer, prompts: list, model: GLMModel, kv_cache: DSAKVCache) -> tuple[Tensor, Tensor, Tensor, list[bool]]:
+def prefill(tokenizer: GLMTokenizer, prompts: list, model: GLMModel, kv_cache: DSAKVCache) -> tuple[Tensor, Tensor, list[bool]]:
   input_tokens, positional_ids = prefill_encode_and_pad(tokenizer, prompts)
   batches = [True for _ in range(input_tokens.shape[0])]
   outputs = model(input_tokens, positional_ids, kv_cache)
-  return input_tokens, outputs, (positional_ids[:, -1] + 1), batches
+  outputs = outputs.reshape(input_tokens.shape[0], 1)
+  next_pos = (positional_ids[:, -1] + 1).reshape(input_tokens.shape[0], 1)
+  return outputs, next_pos, batches
 
-def decode(input_tokens: Tensor, positional_ids: Tensor, kv_cache: DSAKVCache) -> tuple[Tensor, Tensor, Tensor]:
+def decode(input_tokens: Tensor, positional_ids: Tensor, model: GLMModel, kv_cache: DSAKVCache) -> tuple[Tensor, Tensor, Tensor]:
+  batches = input_tokens.shape[0]
   outputs = model(input_tokens, positional_ids, kv_cache)
-  positional_ids = positional_ids + 1
-  positional_ids = positional_ids.reshape(len(batches), 1)
-  input_tokens = outputs.reshape(len(batches), 1)
-  return input_tokens, positional_ids, outputs
+  positional_ids = (positional_ids + 1).reshape(batches, 1)
+  return outputs.reshape(batches, 1), positional_ids, outputs
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser()
@@ -498,10 +500,11 @@ if __name__ == "__main__":
     "add_generation_prompt": True
   }
 
-  input_tokens, outputs, positional_ids, batches = prefill(tokenizer, [prompt_one, prompt_two, prompt_three], model, kv_cache)
+  outputs, positional_ids, batches = prefill(tokenizer, [prompt_one, prompt_two, prompt_three], model, kv_cache)
 
   while True:
-    input_tokens, positional_ids, outputs = decode(input_tokens, positional_ids, kv_cache)
+    input_tokens = outputs
+    input_tokens, positional_ids, outputs = decode(input_tokens, positional_ids, model, kv_cache)
     decoded_ids, decoded_strs = decode_tokens(tokenizer, outputs)
     for b, (id, tok) in enumerate(zip(decoded_ids, decoded_strs)):
       if not batches[b]: continue
